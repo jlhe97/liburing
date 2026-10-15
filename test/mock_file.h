@@ -9,6 +9,7 @@ enum {
 	IORING_MOCK_FEAT_RW_NOWAIT,
 	IORING_MOCK_FEAT_RW_ASYNC,
 	IORING_MOCK_FEAT_POLL,
+	IORING_MOCK_FEAT_POLL_WAKE,
 
 	IORING_MOCK_FEAT_END,
 };
@@ -38,6 +39,14 @@ enum {
 
 enum {
 	IORING_MOCK_CMD_COPY_REGBUF,
+	IORING_MOCK_CMD_POLL_WAKE,
+};
+
+struct io_uring_mock_poll_wake {
+	__u32		events;
+	__u32		nr_wakeups;
+	__u32		nr_wakeups_on_poll;
+	__u32		__resv[5];
 };
 
 enum {

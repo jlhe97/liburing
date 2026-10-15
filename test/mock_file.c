@@ -81,6 +81,33 @@ static int create_mock_file(struct io_uring_mock_create *mc)
 	return 0;
 }
 
+static int poll_wake(int mock_fd, unsigned int nr_wakeups,
+		     unsigned int nr_wakeups_on_poll)
+{
+	struct io_uring_mock_poll_wake arg = {
+		.events = POLLIN,
+		.nr_wakeups = nr_wakeups,
+		.nr_wakeups_on_poll = nr_wakeups_on_poll,
+	};
+	struct io_uring_cqe *cqe;
+	struct io_uring_sqe *sqe;
+	int ret;
+
+	sqe = io_uring_get_sqe(&mgr_ring);
+	io_uring_prep_uring_cmd(sqe, IORING_MOCK_CMD_POLL_WAKE, mock_fd);
+	sqe->addr = (__u64)(unsigned long)&arg;
+	sqe->len = sizeof(arg);
+
+	ret = t_submit_and_wait_single(&mgr_ring, &cqe);
+	if (ret || cqe->res) {
+		fprintf(stderr, "poll wake command failed %i %i\n", ret,
+			cqe->res);
+		return T_EXIT_FAIL;
+	}
+	io_uring_cqe_seen(&mgr_ring, cqe);
+	return T_EXIT_PASS;
+}
+
 static int t_copy_regvec(struct io_uring *ring, int mock_fd,
 			 struct iovec *iov, unsigned iov_len, char *buf,
 			 bool from_iov)
@@ -352,6 +379,90 @@ static int test_rw(void)
 	return 0;
 }
 
+/* Keep in sync with IO_POLL_REF_BIAS in the kernel's io_uring/poll.c. */
+#define POLL_REF_BIAS 128
+
+static int test_poll_retry(void)
+{
+	struct __kernel_timespec ts = { .tv_sec = 1 };
+	struct io_uring_mock_create mc = {
+		.flags = IORING_MOCK_CREATE_F_POLL,
+	};
+	struct io_uring_cqe *cqe;
+	struct io_uring_sqe *sqe;
+	struct io_uring ring;
+	int mock_fd, ret, i;
+
+	if (!has_feature(IORING_MOCK_FEAT_POLL_WAKE)) {
+		printf("no mock poll wake support, skip\n");
+		return T_EXIT_PASS;
+	}
+
+	if (create_mock_file(&mc))
+		return T_EXIT_FAIL;
+	mock_fd = mc.out_fd;
+
+	ret = io_uring_queue_init(8, &ring, IORING_SETUP_SINGLE_ISSUER |
+					       IORING_SETUP_DEFER_TASKRUN);
+	if (ret) {
+		fprintf(stderr, "poll ring setup failed: %d\n", ret);
+		close(mock_fd);
+		return T_EXIT_FAIL;
+	}
+
+	sqe = io_uring_get_sqe(&ring);
+	io_uring_prep_poll_multishot(sqe, mock_fd, POLLIN);
+	sqe->user_data = 1;
+	ret = io_uring_submit(&ring);
+	if (ret != 1) {
+		fprintf(stderr, "poll submit failed: %d\n", ret);
+		goto err;
+	}
+	if (io_uring_cq_ready(&ring)) {
+		fprintf(stderr, "poll completed before task work was run\n");
+		goto err;
+	}
+
+	/*
+	 * Queue enough wakeups to force io_poll_get_ownership_slowpath().
+	 * The wakeup from the next ->poll() invocation then sets the retry
+	 * flag while io_poll_check_events() is preparing to drop ownership.
+	 */
+	ret = poll_wake(mock_fd, POLL_REF_BIAS, 1);
+	if (ret)
+		goto err;
+
+	ret = io_uring_submit_and_wait_timeout(&ring, &cqe, 2, &ts, NULL);
+	if (ret) {
+		fprintf(stderr, "waiting for retry CQE failed: %d\n", ret);
+		goto err;
+	}
+
+	for (i = 0; i < 2; i++) {
+		ret = io_uring_peek_cqe(&ring, &cqe);
+		if (ret) {
+			fprintf(stderr, "missing poll CQE %d: %d\n", i, ret);
+			goto err;
+		}
+		if (cqe->user_data != 1 || !(cqe->res & POLLIN) ||
+		    !(cqe->flags & IORING_CQE_F_MORE)) {
+			fprintf(stderr, "bad poll CQE %d: data=%llu res=%d flags=%x\n",
+				i, (unsigned long long)cqe->user_data, cqe->res,
+				cqe->flags);
+			goto err;
+		}
+		io_uring_cqe_seen(&ring, cqe);
+	}
+
+	io_uring_queue_exit(&ring);
+	close(mock_fd);
+	return T_EXIT_PASS;
+err:
+	io_uring_queue_exit(&ring);
+	close(mock_fd);
+	return T_EXIT_FAIL;
+}
+
 int main(int argc, char *argv[])
 {
 	int ret;
@@ -370,6 +481,12 @@ int main(int argc, char *argv[])
 	ret = test_rw();
 	if (ret) {
 		fprintf(stderr, "test_rw failed %i\n", ret);
+		return T_EXIT_FAIL;
+	}
+
+	ret = test_poll_retry();
+	if (ret) {
+		fprintf(stderr, "test_poll_retry failed %i\n", ret);
 		return T_EXIT_FAIL;
 	}
 
